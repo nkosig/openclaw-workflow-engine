@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Vitest Watch",
+      "runtimeExecutable": "/usr/local/bin/node",
+      "runtimeArgs": ["node_modules/.bin/vitest"],
+      "port": 0
+    },
+    {
+      "name": "Vitest UI",
+      "runtimeExecutable": "/usr/local/bin/node",
+      "runtimeArgs": ["node_modules/.bin/vitest", "--ui"],
+      "port": 51204
+    }
+  ]
+}
