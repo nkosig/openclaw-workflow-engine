@@ -1,0 +1,29 @@
+{
+  "name": "@openclaw-community/workflow-engine",
+  "version": "0.1.0",
+  "description": "State machine workflow enforcement for OpenClaw agents. Prevents LLM drift in structured workflows by enforcing deterministic state transitions, per-state tool scoping, input validation, and persistent audit logging.",
+  "entry": "dist/openclaw-plugin.js",
+  "capabilities": ["tools", "hooks", "services"],
+  "configuration": {
+    "workflowsDir": {
+      "type": "string",
+      "default": ".openclaw/workflows",
+      "description": "Directory containing compiled workflow definition files (.js). TypeScript sources must be compiled first."
+    },
+    "dbPath": {
+      "type": "string",
+      "default": ".openclaw/workflow.db",
+      "description": "SQLite database path for workflow state persistence."
+    },
+    "enableDashboard": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable the HTTP dashboard for workflow visualization and audit log inspection."
+    },
+    "dashboardPort": {
+      "type": "number",
+      "default": 3847,
+      "description": "TCP port for the workflow dashboard (only used when enableDashboard is true)."
+    }
+  }
+}

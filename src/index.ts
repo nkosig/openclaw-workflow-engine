@@ -8,6 +8,23 @@ export { WorkflowMCPServer } from "./mcp-server.js";
 export type { WorkflowMCPServerConfig } from "./mcp-server.js";
 export { loadWorkflowsFromDir } from "./mcp-server.js";
 
+// OpenClaw Plugin API
+export { default as registerOpenClawPlugin } from "./openclaw-plugin.js";
+export type {
+  OpenClawPluginApi,
+  PluginConfig,
+  ServiceInstance,
+  WorkflowServiceInstance,
+  PromptConstructContext,
+  ToolCallContext,
+  ToolRegistration,
+  McpServerRegistration,
+  ToolGuardResult,
+} from "./openclaw-plugin.js";
+
+// Dashboard
+export { startDashboard } from "./dashboard.js";
+
 export type {
   WorkflowDefinition,
   ToolDefinition,
@@ -19,4 +36,5 @@ export type {
   ValidationResult,
   IdempotencyResult,
   InstanceRow,
+  HandleToolResultOutput,
 } from "./types.js";
