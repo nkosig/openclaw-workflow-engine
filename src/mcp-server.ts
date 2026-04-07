@@ -234,13 +234,14 @@ export class WorkflowMCPServer {
       { instanceId: z.string().describe("The workflow instance ID to cancel") },
       async ({ instanceId }) => {
         try {
-          // getStatus throws if the instance doesn't exist, providing validation
-          const { workflowId } = this.engine.getStatus(instanceId);
+          // getStatus throws if the instance doesn't exist, providing validation.
+          // Capture context so the fresh instance inherits the same initial data.
+          const { workflowId, context } = this.engine.getStatus(instanceId);
           this.engine.resetWorkflow(instanceId);
           this.activeInstances.delete(workflowId);
           this._removeDynamicToolsForWorkflow(workflowId);
-          // Immediately start a fresh replacement instance
-          const fresh = this.engine.startWorkflow(workflowId);
+          // Immediately start a fresh replacement instance, preserving context.
+          const fresh = this.engine.startWorkflow(workflowId, context);
           this.activeInstances.set(workflowId, fresh.instanceId);
           // _syncDynamicTools registers new-state tools and emits tools/list_changed
           this._syncDynamicTools(workflowId, fresh.instanceId);

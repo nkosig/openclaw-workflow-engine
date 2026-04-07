@@ -30,6 +30,8 @@ export interface PluginConfig {
   dbPath?: string;
   enableDashboard?: boolean;
   dashboardPort?: number;
+  /** Suppress startup log messages (e.g. dashboard URL). Useful in tests. */
+  silent?: boolean;
 }
 
 /** A long-running background service managed by OpenClaw */
@@ -117,6 +119,7 @@ interface ResolvedPluginConfig {
   dbPath: string;
   enableDashboard: boolean;
   dashboardPort: number;
+  silent: boolean;
 }
 
 function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
@@ -125,6 +128,7 @@ function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
     dbPath: raw.dbPath ?? ".openclaw/workflow.db",
     enableDashboard: raw.enableDashboard ?? false,
     dashboardPort: raw.dashboardPort ?? 3847,
+    silent: raw.silent ?? false,
   };
 }
 
@@ -183,7 +187,9 @@ export default function register(api: OpenClawPluginApi): void {
       }
 
       if (config.enableDashboard) {
-        dashboardServer = await startDashboard(engine, config.dashboardPort);
+        dashboardServer = await startDashboard(engine, config.dashboardPort, {
+          silent: config.silent,
+        });
       }
     },
 
@@ -273,7 +279,12 @@ export default function register(api: OpenClawPluginApi): void {
       const { instanceId } = input as { instanceId: string };
       const status = engine.getStatus(instanceId);
       engine.resetWorkflow(instanceId);
-      const newInstance = engine.startWorkflow(status.workflowId);
+      // Preserve the original instance's context so the fresh instance starts
+      // with the same workflowId-scoped data (e.g. userId, sessionId).
+      const newInstance = engine.startWorkflow(
+        status.workflowId,
+        status.context,
+      );
       return {
         reset: true,
         cancelledInstanceId: instanceId,

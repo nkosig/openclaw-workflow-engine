@@ -562,6 +562,7 @@ describe("openclaw-plugin — service lifecycle", () => {
     const { api } = await createCtx({
       enableDashboard: true,
       dashboardPort: 0,
+      silent: true,
     });
     const service = api.services.get(
       "workflow-engine",
@@ -582,6 +583,7 @@ describe("openclaw-plugin — service lifecycle", () => {
     const { api } = await createCtx({
       enableDashboard: true,
       dashboardPort: 0,
+      silent: true,
     });
     const service = api.services.get(
       "workflow-engine",

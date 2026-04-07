@@ -356,6 +356,9 @@ export class WorkflowEngine {
    *   3. Fires the onSuccess state transition (if configured for this tool)
    *   4. Executes the read-after-write tool if requiresReadAfterWrite is set
    *
+   * This method is async because step 4 (read-after-write) calls executeTool
+   * which may await external async tool handlers.
+   *
    * Returns { success, newState, stateChanged, readResult?, error? }.
    */
   async handleToolResult(

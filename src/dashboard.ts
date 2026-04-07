@@ -32,8 +32,18 @@ function machineToMermaid(machine: AnyStateMachine): string {
     | undefined;
   if (!defStates) return "stateDiagram-v2\n  [*] --> unknown";
 
-  // Strip XState's fully-qualified ID prefix: "#(machineId).stateName" → "stateName"
-  const bare = (fqid: string): string => fqid.replace(/^#[^.]+\./, "");
+  // In XState v5's normalised form, transition targets are StateNode objects
+  // whose `.key` property is the local state name (e.g. "step_b").
+  // When targets arrive as fully-qualified ID strings (e.g. "#(machineId).step_b")
+  // we strip the prefix.  Handle both forms defensively.
+  const toBareName = (node: unknown): string => {
+    if (typeof node === "string") return node.replace(/^#[^.]+\./, "");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const n = node as any;
+    if (n && typeof n.key === "string") return n.key;
+    if (n && typeof n.id === "string") return n.id.replace(/^[^.]+\./, "");
+    return String(node);
+  };
 
   const lines: string[] = ["stateDiagram-v2"];
   for (const [name, state] of Object.entries(defStates)) {
@@ -42,13 +52,15 @@ function machineToMermaid(machine: AnyStateMachine): string {
     }
     if (state.on && typeof state.on === "object") {
       for (const [event, transitions] of Object.entries(
-        state.on as Record<string, Array<{ target: string[] }>>,
+        state.on as Record<string, Array<{ target: unknown[] | undefined }>>,
       )) {
         const targets: string[] = Array.isArray(transitions)
-          ? transitions.flatMap((t) => t.target ?? [])
+          ? transitions.flatMap((t) =>
+              Array.isArray(t.target) ? t.target.map(toBareName) : [],
+            )
           : [];
         for (const target of targets) {
-          lines.push(`  ${name} --> ${bare(target)} : ${event}`);
+          lines.push(`  ${name} --> ${target} : ${event}`);
         }
       }
     }
@@ -138,6 +150,7 @@ export function buildDashboardHtml(engine: WorkflowEngine): string {
 export async function startDashboard(
   engine: WorkflowEngine,
   port: number,
+  options?: { silent?: boolean },
 ): Promise<Server> {
   const server = createServer((_req, res) => {
     const body = buildDashboardHtml(engine);
@@ -152,8 +165,10 @@ export async function startDashboard(
 
   const addr = server.address();
   const boundPort = addr && typeof addr === "object" ? addr.port : port;
-  process.stderr.write(
-    `[workflow-engine] Dashboard running at http://localhost:${boundPort}\n`,
-  );
+  if (!options?.silent) {
+    process.stderr.write(
+      `[workflow-engine] Dashboard running at http://localhost:${boundPort}\n`,
+    );
+  }
   return server;
 }
