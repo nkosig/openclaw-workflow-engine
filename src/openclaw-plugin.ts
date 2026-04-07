@@ -36,6 +36,8 @@ export interface PluginConfig {
 
 /** A long-running background service managed by OpenClaw */
 export interface ServiceInstance {
+  /** Unique service identifier — OpenClaw calls service.id.trim() at registration */
+  id: string;
   /** Called by OpenClaw when the plugin is activated */
   start(): Promise<void>;
   /** Called by OpenClaw on shutdown or plugin disable */
@@ -45,7 +47,8 @@ export interface ServiceInstance {
 /** A service instance that also exposes the engine for tests / advanced callers */
 export interface WorkflowServiceInstance extends ServiceInstance {
   /** Direct access to the engine — used in tests to register workflow definitions */
-  readonly engine: WorkflowEngine; /** The HTTP dashboard server when running, or null. Exposed for tests and health checks. */
+  readonly engine: WorkflowEngine;
+  /** The HTTP dashboard server when running, or null. Exposed for tests and health checks. */
   readonly dashboardServer: import("node:http").Server | null;
 }
 
@@ -66,6 +69,7 @@ export interface ToolCallContext {
 
 /** Registration options for a control tool */
 export interface ToolRegistration {
+  name: string;
   description: string;
   inputSchema: Record<string, unknown>;
   handler: (input: Record<string, unknown>) => Promise<unknown>;
@@ -90,9 +94,9 @@ export interface OpenClawPluginApi {
   /** Configuration values from openclaw.plugin.json under `configuration` */
   config: PluginConfig;
   /** Register a long-running background service */
-  registerService(name: string, service: ServiceInstance): void;
+  registerService(service: ServiceInstance): void;
   /** Register a tool that appears in the agent's tool list */
-  registerTool(name: string, options: ToolRegistration): void;
+  registerTool(tool: ToolRegistration): void;
   /** Register a beforePromptConstruct hook */
   registerHook(
     event: "beforePromptConstruct",
@@ -150,7 +154,12 @@ function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
  * ```
  */
 export default function register(api: OpenClawPluginApi): void {
+  const log = (msg: string) =>
+    process.stderr.write(`[workflow-engine] register: ${msg}\n`);
+
+  log("starting");
   const config = resolveConfig(api.config ?? {});
+  log(`config resolved: dbPath=${config.dbPath} workflowsDir=${config.workflowsDir}`);
   const engine = new WorkflowEngine(config.dbPath);
 
   // ── 1. Background service ──────────────────────────────────────────────────
@@ -162,6 +171,7 @@ export default function register(api: OpenClawPluginApi): void {
   let dashboardServer: import("node:http").Server | null = null;
 
   const service: WorkflowServiceInstance = {
+    id: "workflow-engine",
     engine,
     get dashboardServer() {
       return dashboardServer;
@@ -206,11 +216,55 @@ export default function register(api: OpenClawPluginApi): void {
     },
   };
 
-  api.registerService("workflow-engine", service);
+  // Fire-and-forget initialization: load workflow definitions and optionally
+  // start the dashboard.  This runs whether or not registerService succeeds,
+  // so the tools work even when OpenClaw's service lifecycle is unavailable.
+  void (async () => {
+    const defs = await loadWorkflowsFromDir(config.workflowsDir, {
+      silent: true,
+    });
+    for (const def of defs) {
+      engine.registerWorkflow(def);
+      process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
+    }
+    if (config.enableDashboard) {
+      dashboardServer = await startDashboard(engine, config.dashboardPort, {
+        silent: config.silent,
+      });
+    }
+  })();
+
+  if (typeof api.registerService === "function") {
+    log("registerService…");
+    try {
+      api.registerService(service);
+      log("registerService ok");
+    } catch (e) {
+      log(`registerService threw: ${e} — skipping service lifecycle`);
+    }
+  } else {
+    log("registerService skipped (not available in this OpenClaw version)");
+  }
 
   // ── 2. Control tools ───────────────────────────────────────────────────────
 
-  api.registerTool("workflow_list", {
+  // Helper: wrap registerTool so a bad schema/options crash is logged but does
+  // not abort the rest of registration.
+  const tryRegisterTool = (tool: ToolRegistration) => {
+    log(`registerTool ${tool.name}…`);
+    try {
+      api.registerTool(tool);
+      log(`registerTool ${tool.name} ok`);
+    } catch (e) {
+      const stack = e instanceof Error
+        ? e.stack?.split("\n").slice(0, 6).join(" | ")
+        : String(e);
+      log(`registerTool ${name} threw: ${e} | stack: ${stack}`);
+    }
+  };
+
+  tryRegisterTool({
+    name: "workflow_list",
     description: "List all registered workflows and their current status",
     inputSchema: {},
     async handler() {
@@ -234,20 +288,14 @@ export default function register(api: OpenClawPluginApi): void {
     },
   });
 
-  api.registerTool("workflow_start", {
+  tryRegisterTool({
+    name: "workflow_start",
     description: "Start a new workflow instance",
     inputSchema: {
-      workflowId: {
-        type: "string",
-        description: "ID of the workflow to start",
-      },
-      context: {
-        type: "object",
-        description: "Optional initial context",
-        additionalProperties: true,
-      },
+      workflowId: { type: "string", description: "ID of the workflow to start", required: true },
+      context: { type: "object", description: "Optional initial context" },
     },
-    async handler(input) {
+    async handler(input: Record<string, unknown>) {
       const { workflowId, context } = input as {
         workflowId: string;
         context?: Record<string, unknown>;
@@ -256,32 +304,29 @@ export default function register(api: OpenClawPluginApi): void {
     },
   });
 
-  api.registerTool("workflow_status", {
+  tryRegisterTool({
+    name: "workflow_status",
     description:
       "Get the current state, available tools, and progress of a workflow instance",
     inputSchema: {
-      instanceId: { type: "string", description: "Workflow instance ID" },
+      instanceId: { type: "string", description: "Workflow instance ID", required: true },
     },
-    async handler(input) {
+    async handler(input: Record<string, unknown>) {
       const { instanceId } = input as { instanceId: string };
       return engine.getStatus(instanceId);
     },
   });
 
-  api.registerTool("workflow_reset", {
+  tryRegisterTool({
+    name: "workflow_reset",
     description: "Cancel a workflow instance and start a fresh one",
     inputSchema: {
-      instanceId: {
-        type: "string",
-        description: "Workflow instance ID to reset",
-      },
+      instanceId: { type: "string", description: "Workflow instance ID to reset", required: true },
     },
-    async handler(input) {
+    async handler(input: Record<string, unknown>) {
       const { instanceId } = input as { instanceId: string };
       const status = engine.getStatus(instanceId);
       engine.resetWorkflow(instanceId);
-      // Preserve the original instance's context so the fresh instance starts
-      // with the same workflowId-scoped data (e.g. userId, sessionId).
       const newInstance = engine.startWorkflow(
         status.workflowId,
         status.context,
@@ -294,16 +339,14 @@ export default function register(api: OpenClawPluginApi): void {
     },
   });
 
-  api.registerTool("workflow_audit", {
+  tryRegisterTool({
+    name: "workflow_audit",
     description: "Retrieve the audit log for a workflow instance",
     inputSchema: {
-      instanceId: { type: "string", description: "Workflow instance ID" },
-      limit: {
-        type: "number",
-        description: "Maximum number of entries to return (default 100)",
-      },
+      instanceId: { type: "string", description: "Workflow instance ID", required: true },
+      limit: { type: "number", description: "Maximum number of entries to return (default 100)" },
     },
-    async handler(input) {
+    async handler(input: Record<string, unknown>) {
       const { instanceId, limit } = input as {
         instanceId: string;
         limit?: number;
@@ -322,6 +365,7 @@ export default function register(api: OpenClawPluginApi): void {
    * full workflow context being loaded for every turn (StateFlow pattern —
    * see atlas-workflow-plugin-research.md for the 4-6x cost-reduction reference).
    */
+  log("registerHook beforePromptConstruct…");
   api.registerHook(
     "beforePromptConstruct",
     async (ctx: PromptConstructContext) => {
@@ -347,6 +391,7 @@ export default function register(api: OpenClawPluginApi): void {
       return ctx;
     },
   );
+  log("registerHook beforePromptConstruct ok");
 
   /**
    * beforeToolCall — enforce per-state tool scoping.
@@ -359,6 +404,7 @@ export default function register(api: OpenClawPluginApi): void {
    * workflow.  Invalid calls are blocked with a human-readable reason
    * (enforcement layer 3 of 4).
    */
+  log("registerHook beforeToolCall…");
   api.registerHook("beforeToolCall", async (ctx: ToolCallContext) => {
     for (const workflowId of engine.getRegisteredWorkflowIds()) {
       const active = engine.getActiveWorkflow(workflowId);
@@ -383,6 +429,7 @@ export default function register(api: OpenClawPluginApi): void {
     }
     return { blocked: false };
   });
+  log("registerHook beforeToolCall ok");
 
   /**
    * afterToolCall — run output validation, advance state machine, and execute
@@ -392,6 +439,7 @@ export default function register(api: OpenClawPluginApi): void {
    * hooks always route to the same workflow instance, even when tool names
    * overlap across multiple active workflows.
    */
+  log("registerHook afterToolCall…");
   api.registerHook(
     "afterToolCall",
     async (ctx: ToolCallContext, result: unknown) => {
@@ -417,23 +465,31 @@ export default function register(api: OpenClawPluginApi): void {
       return result;
     },
   );
+  log("registerHook afterToolCall ok");
 
   // ── 4. MCP server side-car ─────────────────────────────────────────────────
   //
   // Registers an MCP server that exposes the same workflow tools over a
   // portable protocol, enabling access from any MCP-compatible client (Claude
   // Code, Cursor, etc.) independently of OpenClaw's hook system.
-  api.registerMcpServer({
-    name: "workflow-engine",
-    transport: "stdio",
-    command: "npx",
-    args: [
-      "workflow-engine",
-      "serve",
-      "--workflows",
-      config.workflowsDir,
-      "--db",
-      config.dbPath,
-    ],
-  });
+  if (typeof api.registerMcpServer === "function") {
+    log("registerMcpServer…");
+    api.registerMcpServer({
+      name: "workflow-engine",
+      transport: "stdio",
+      command: "npx",
+      args: [
+        "workflow-engine",
+        "serve",
+        "--workflows",
+        config.workflowsDir,
+        "--db",
+        config.dbPath,
+      ],
+    });
+    log("registerMcpServer ok");
+  } else {
+    log("registerMcpServer skipped (api.registerMcpServer not available)");
+  }
+  log("register complete");
 }
