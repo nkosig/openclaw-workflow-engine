@@ -123,9 +123,10 @@ interface ResolvedPluginConfig {
 }
 
 function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? ".";
   return {
-    workflowsDir: raw.workflowsDir ?? ".openclaw/workflows",
-    dbPath: raw.dbPath ?? ".openclaw/workflow.db",
+    workflowsDir: raw.workflowsDir ?? `${home}/.openclaw/workflows`,
+    dbPath: raw.dbPath ?? `${home}/.openclaw/workflow.db`,
     enableDashboard: raw.enableDashboard ?? false,
     dashboardPort: raw.dashboardPort ?? 3847,
     silent: raw.silent ?? false,

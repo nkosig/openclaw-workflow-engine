@@ -1,4 +1,6 @@
 import Database from 'better-sqlite3'
+import { mkdirSync } from 'node:fs'
+import { resolve, dirname } from 'node:path'
 import type { InstanceRow, AuditEntry } from './types.js'
 
 const SCHEMA_SQL = `
@@ -46,6 +48,9 @@ export class PersistenceLayer {
   private db: Database.Database
 
   constructor(dbPath: string = './workflow.db') {
+    if (dbPath !== ':memory:') {
+      mkdirSync(dirname(resolve(dbPath)), { recursive: true })
+    }
     this.db = new Database(dbPath)
     this.db.pragma('journal_mode = WAL')
     this.db.exec(SCHEMA_SQL)
