@@ -25,11 +25,6 @@
   "openclaw": {
     "extensions": [
       "./dist/openclaw-plugin.js"
-    ],
-    "hooks": [
-      "beforePromptConstruct",
-      "beforeToolCall",
-      "afterToolCall"
     ]
   },
   "dependencies": {
