@@ -18,6 +18,8 @@
 import { WorkflowEngine } from "./engine.js";
 import { loadWorkflowsFromDir } from "./mcp-server.js";
 import { startDashboard } from "./dashboard.js";
+import { readdirSync } from "node:fs";
+import { resolve } from "node:path";
 
 // ─── OpenClaw SDK type mirrors ────────────────────────────────────────────────
 // These interfaces mirror the @openclaw/sdk shape documented in
@@ -94,9 +96,9 @@ export interface OpenClawPluginApi {
   /** Configuration values from openclaw.plugin.json under `configuration` */
   config: PluginConfig;
   /** Register a long-running background service */
-  registerService(service: ServiceInstance): void;
+  registerService(name: string, service: ServiceInstance): void;
   /** Register a tool that appears in the agent's tool list */
-  registerTool(tool: ToolRegistration): void;
+  registerTool(name: string, tool: ToolRegistration): void;
   /** Register a beforePromptConstruct hook */
   registerHook(
     event: "beforePromptConstruct",
@@ -137,6 +139,32 @@ function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
   };
 }
 
+async function registerWorkflowsFromDirectory(
+  engine: WorkflowEngine,
+  workflowsDir: string,
+): Promise<void> {
+  const absDir = resolve(workflowsDir);
+  try {
+    const entries = readdirSync(absDir);
+    for (const entry of entries) {
+      if (!entry.endsWith(".yaml") && !entry.endsWith(".yml")) continue;
+      const filePath = resolve(absDir, entry);
+      engine.registerWorkflowFromYaml(filePath);
+      process.stderr.write(`[workflow-engine] Loaded YAML workflow: ${filePath}\n`);
+    }
+  } catch {
+    // ignore missing directories; JS loader handles warnings/silence behavior
+  }
+
+  const defs = await loadWorkflowsFromDir(workflowsDir, {
+    silent: true,
+  });
+  for (const def of defs) {
+    engine.registerWorkflow(def);
+    process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
+  }
+}
+
 // ─── Plugin entry point ───────────────────────────────────────────────────────
 
 /**
@@ -154,11 +182,15 @@ function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
  * ```
  */
 export default function register(api: OpenClawPluginApi): void {
-  const log = (msg: string) =>
-    process.stderr.write(`[workflow-engine] register: ${msg}\n`);
+  const config = resolveConfig(api.config ?? {});
+  const shouldLog = !config.silent && process.env.NODE_ENV !== "test";
+  const log = (msg: string) => {
+    if (shouldLog) {
+      process.stderr.write(`[workflow-engine] register: ${msg}\n`);
+    }
+  };
 
   log("starting");
-  const config = resolveConfig(api.config ?? {});
   log(`config resolved: dbPath=${config.dbPath} workflowsDir=${config.workflowsDir}`);
   const engine = new WorkflowEngine(config.dbPath);
 
@@ -178,16 +210,7 @@ export default function register(api: OpenClawPluginApi): void {
     },
 
     async start(): Promise<void> {
-      // Load compiled .js workflow definitions from the configured directory.
-      // silent: true suppresses the missing-dir warning (the directory may not
-      // exist yet on first run — the user creates it when they add workflows).
-      const defs = await loadWorkflowsFromDir(config.workflowsDir, {
-        silent: true,
-      });
-      for (const def of defs) {
-        engine.registerWorkflow(def);
-        process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
-      }
+      await registerWorkflowsFromDirectory(engine, config.workflowsDir);
 
       // Guard against double-start: close any prior dashboard listener first.
       if (dashboardServer) {
@@ -220,13 +243,7 @@ export default function register(api: OpenClawPluginApi): void {
   // start the dashboard.  This runs whether or not registerService succeeds,
   // so the tools work even when OpenClaw's service lifecycle is unavailable.
   void (async () => {
-    const defs = await loadWorkflowsFromDir(config.workflowsDir, {
-      silent: true,
-    });
-    for (const def of defs) {
-      engine.registerWorkflow(def);
-      process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
-    }
+    await registerWorkflowsFromDirectory(engine, config.workflowsDir);
     if (config.enableDashboard) {
       dashboardServer = await startDashboard(engine, config.dashboardPort, {
         silent: config.silent,
@@ -237,7 +254,7 @@ export default function register(api: OpenClawPluginApi): void {
   if (typeof api.registerService === "function") {
     log("registerService…");
     try {
-      api.registerService(service);
+      api.registerService(service.id, service);
       log("registerService ok");
     } catch (e) {
       log(`registerService threw: ${e} — skipping service lifecycle`);
@@ -253,13 +270,13 @@ export default function register(api: OpenClawPluginApi): void {
   const tryRegisterTool = (tool: ToolRegistration) => {
     log(`registerTool ${tool.name}…`);
     try {
-      api.registerTool(tool);
+      api.registerTool(tool.name, tool);
       log(`registerTool ${tool.name} ok`);
     } catch (e) {
       const stack = e instanceof Error
         ? e.stack?.split("\n").slice(0, 6).join(" | ")
         : String(e);
-      log(`registerTool ${name} threw: ${e} | stack: ${stack}`);
+      log(`registerTool ${tool.name} threw: ${e} | stack: ${stack}`);
     }
   };
 

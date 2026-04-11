@@ -159,7 +159,7 @@ export async function startDashboard(
   });
 
   await new Promise<void>((resolve, reject) => {
-    server.listen(port, () => resolve());
+    server.listen(port, "127.0.0.1", () => resolve());
     server.once("error", reject);
   });
 

@@ -1,6 +1,14 @@
 import { PersistenceLayer } from "./persistence.js";
 import { WorkflowMachine } from "./machine.js";
 import { ValidationLayer } from "./validation.js";
+import { loadWorkflowFromYaml, type LoadedYamlWorkflow } from "./config/loader.js";
+import { StepExecutor } from "./executors/step-executor.js";
+import { SqlExecutor } from "./executors/sql-executor.js";
+import { HttpExecutor } from "./executors/http-executor.js";
+import {
+  resolveTemplate,
+  type TemplateScope,
+} from "./config/templates.js";
 import type {
   WorkflowDefinition,
   ToolDefinition,
@@ -11,9 +19,14 @@ import type {
   HandleToolResultOutput,
 } from "./types.js";
 
+interface YamlRuntimeDefinition {
+  filePath: string;
+  loaded: LoadedYamlWorkflow;
+}
+
 /**
  * Main workflow engine orchestrator.
- * Combines the state machine, persistence, and validation layers.
+ * Combines the state machine, persistence, validation, and YAML runtime execution layers.
  */
 export class WorkflowEngine {
   private persistence: PersistenceLayer;
@@ -21,19 +34,109 @@ export class WorkflowEngine {
   private validation: ValidationLayer;
   /** workflowId → WorkflowDefinition (for prompt lookup, tool routing, and dashboard) */
   private readonly definitions = new Map<string, WorkflowDefinition>();
+  /** workflowId → YAML runtime metadata */
+  private readonly yamlRuntime = new Map<string, YamlRuntimeDefinition>();
+  private readonly sqlExecutor: SqlExecutor;
+  private readonly httpExecutor: HttpExecutor;
 
   constructor(dbPath?: string) {
     this.persistence = new PersistenceLayer(dbPath);
     this.machine = new WorkflowMachine(this.persistence);
     this.validation = new ValidationLayer(this.machine, this.persistence);
+    this.sqlExecutor = new SqlExecutor();
+    this.httpExecutor = new HttpExecutor();
   }
 
   /**
-   * Register a workflow definition so it can be started via startWorkflow().
+   * Register a TypeScript workflow definition so it can be started via startWorkflow().
    */
   registerWorkflow(definition: WorkflowDefinition): void {
     this.machine.registerDefinition(definition);
     this.definitions.set(definition.id, definition);
+  }
+
+  /**
+   * Register a YAML workflow file.
+   * Loads, validates, runs pending migrations, and registers the generated internal definition.
+   */
+  registerWorkflowFromYaml(filePath: string): void {
+    const loaded = loadWorkflowFromYaml(filePath);
+    this.applyMigrations(loaded);
+    this.registerWorkflow(loaded.definition);
+    this.yamlRuntime.set(loaded.definition.id, {
+      filePath: loaded.filePath,
+      loaded,
+    });
+  }
+
+  /**
+   * Validate a YAML workflow file without registering it.
+   */
+  validateWorkflowYaml(filePath: string): LoadedYamlWorkflow {
+    return loadWorkflowFromYaml(filePath);
+  }
+
+  /**
+   * Run pending migrations declared in a YAML workflow file.
+   */
+  runMigrationsForYaml(filePath: string): { workflowId: string; applied: number[] } {
+    const loaded = loadWorkflowFromYaml(filePath);
+    const applied = this.applyMigrations(loaded);
+    return { workflowId: loaded.definition.id, applied };
+  }
+
+  /**
+   * Execute one YAML-defined tool as a dry run (without starting/transitioning an instance).
+   */
+  async dryRunYamlTool(
+    filePath: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const loaded = loadWorkflowFromYaml(filePath);
+    const candidate = Object.entries(loaded.definition.toolsByState)
+      .flatMap(([stateName, tools]) => tools.map((tool) => ({ stateName, tool })))
+      .find(({ tool }) => tool.name === toolName);
+
+    if (!candidate) {
+      throw new Error(`Tool '${toolName}' not found in workflow '${loaded.definition.id}'`);
+    }
+
+    const parsed = candidate.tool.inputSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new Error(`Invalid tool input: ${parsed.error.message}`);
+    }
+
+    const runtime = loaded.toolRuntimeByState[candidate.stateName]?.[toolName];
+    if (!runtime) {
+      throw new Error(`Runtime steps missing for tool '${toolName}'`);
+    }
+
+    const context = { ...(loaded.config.context ?? {}) };
+    const stepExecutor = this.createStepExecutor(loaded);
+    const result = await stepExecutor.executeSteps(
+      runtime.steps,
+      parsed.data as Record<string, unknown>,
+      context,
+      toolName,
+    );
+
+    if (result.error) {
+      return {
+        success: false,
+        error: result.error.message,
+        step: result.error.step,
+      };
+    }
+
+    return {
+      success: true,
+      returned: result.returned,
+      data: result.data,
+      results: result.results,
+      context,
+      transition: result.transition,
+    };
   }
 
   /**
@@ -43,7 +146,8 @@ export class WorkflowEngine {
     workflowId: string,
     context: Record<string, unknown> = {},
   ): WorkflowInstance {
-    return this.machine.createInstance(workflowId, context);
+    const baseContext = this.yamlRuntime.get(workflowId)?.loaded.config.context ?? {};
+    return this.machine.createInstance(workflowId, { ...baseContext, ...context });
   }
 
   /**
@@ -72,23 +176,12 @@ export class WorkflowEngine {
 
   /**
    * Execute a tool call on a workflow instance.
-   *
-   * Steps:
-   * 0. Reject immediately if the instance is final (reset/completed)
-   * 1. Validate tool call (availability + Zod input schema)
-   * 2. Check idempotency — return cached result if duplicate; surface template errors as { success: false }
-   * 3. Validate result against validationsByState[state][toolName] if defined
-   * 4. Log audit events (tool_called, tool_succeeded)
-   * 5. Fire onSuccess transition if configured, advancing the state machine
-   * 6. If requiresReadAfterWrite, execute the readTool in the new state; propagate read failure
-   * 7. Return { success, result, newState, auditId }
    */
   async executeTool(
     instanceId: string,
     toolName: string,
     input: Record<string, unknown>,
   ): Promise<ToolResult> {
-    // 0. Reject if the instance is final (completed or reset) — no tools may execute on closed instances
     if (this.machine.isFinalState(instanceId)) {
       return {
         success: false,
@@ -96,7 +189,11 @@ export class WorkflowEngine {
       };
     }
 
-    // 1. Validate tool call (availability + input schema)
+    const row = this.persistence.loadSnapshot(instanceId);
+    if (!row) {
+      return { success: false, error: `Instance '${instanceId}' not found` };
+    }
+
     const validationResult = this.validation.validateToolCall(
       instanceId,
       toolName,
@@ -107,132 +204,27 @@ export class WorkflowEngine {
     }
 
     const availableTools = this.machine.getAvailableTools(instanceId);
-    const toolDef = availableTools.find((t) => t.name === toolName)!;
-
-    // 2. Check idempotency (scoped to this instance); capture key once for audit log.
-    // buildKey throws if a template field is missing from input — surface as structured error.
-    let idempotencyKey: string | undefined;
-    if (toolDef.idempotencyKeyTemplate) {
-      let idempotencyResult;
-      try {
-        idempotencyResult = this.validation.checkIdempotency(
-          instanceId,
-          toolName,
-          input,
-          toolDef.idempotencyKeyTemplate,
-        );
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        this.persistence.logAudit(instanceId, "validation_failed", toolName, {
-          reason,
-          input,
-        });
-        return { success: false, error: reason };
-      }
-      idempotencyKey = idempotencyResult.key;
-      if (idempotencyResult.duplicate) {
-        this.persistence.logAudit(instanceId, "idempotency_hit", toolName, {
-          idempotency_key: idempotencyResult.key,
-          input,
-        });
-        return {
-          success: true,
-          result: idempotencyResult.existingResult,
-          idempotencyHit: true,
-          newState: this.machine.getCurrentState(instanceId)?.state,
-        };
-      }
+    const toolDef = availableTools.find((t) => t.name === toolName);
+    if (!toolDef) {
+      return { success: false, error: `Tool '${toolName}' is not available` };
     }
 
-    // 3. Validate result against validationsByState[currentState][toolName] if defined.
-    // In Phase 1, the "output" is parsedInput (tools have no executor yet); Phase 2 will
-    // validate real executor return values here.
-    const outputValidator = this.machine.getOutputValidator(
-      instanceId,
-      toolName,
-    );
-    if (outputValidator) {
-      const outputValidation = outputValidator.safeParse(
-        validationResult.parsedInput,
-      );
-      if (!outputValidation.success) {
-        const reason = `Output validation failed for '${toolName}': ${outputValidation.error.message}`;
-        this.persistence.logAudit(instanceId, "validation_failed", toolName, {
-          reason,
-        });
-        return { success: false, error: reason };
-      }
-    }
-
-    // 4. Log audit events
-    this.persistence.logAudit(instanceId, "tool_called", toolName, { input });
-
-    const auditPayload: Record<string, unknown> = {
-      input: validationResult.parsedInput,
-    };
-    if (idempotencyKey) auditPayload.idempotency_key = idempotencyKey;
-
-    const auditId = this.persistence.logAudit(
-      instanceId,
-      "tool_succeeded",
-      toolName,
-      auditPayload,
-    );
-
-    // 5. Fire onSuccess transition if configured
-    let newState = this.machine.getCurrentState(instanceId)?.state;
-    if (toolDef.onSuccess) {
-      const transitionResult = this.machine.transition(
+    const runtime = this.yamlRuntime.get(row.workflow_id);
+    if (runtime) {
+      return this.executeYamlTool(
+        runtime.loaded,
         instanceId,
-        toolDef.onSuccess,
+        row.current_state,
+        toolDef,
         validationResult.parsedInput as Record<string, unknown>,
       );
-      if (!transitionResult.success) {
-        this.persistence.logAudit(instanceId, "transition_failed", toolName, {
-          event: toolDef.onSuccess,
-          reason: transitionResult.reason,
-        });
-        return {
-          success: false,
-          error: `Transition '${toolDef.onSuccess}' failed: ${transitionResult.reason}`,
-        };
-      }
-      newState = transitionResult.newState;
     }
 
-    const result: ToolResult = {
-      success: true,
-      result: validationResult.parsedInput,
-      newState,
-      auditId,
-    };
-
-    // 6. Read-after-write runs in the new state (after transition)
-    if (toolDef.requiresReadAfterWrite && toolDef.readTool) {
-      const readResult = await this.executeTool(
-        instanceId,
-        toolDef.readTool,
-        {},
-      );
-      if (!readResult.success) {
-        this.persistence.logAudit(
-          instanceId,
-          "read_after_write_failed",
-          toolName,
-          {
-            readTool: toolDef.readTool,
-            error: readResult.error,
-          },
-        );
-        return {
-          success: false,
-          error: `Read-after-write failed (${toolDef.readTool}): ${readResult.error}`,
-        };
-      }
-      result.result = readResult.result;
-    }
-
-    return result;
+    return this.executeTypedTool(
+      instanceId,
+      toolDef,
+      validationResult.parsedInput as Record<string, unknown>,
+    );
   }
 
   /**
@@ -305,16 +297,11 @@ export class WorkflowEngine {
     const row = this.persistence.loadSnapshot(instanceId);
     if (!row) return null;
     const def = this.definitions.get(row.workflow_id);
-    return def?.promptsByState?.[row.current_state] ?? null;
+    return def?.promptsByState?.[this.topLevelState(row.current_state)] ?? null;
   }
 
   /**
-   * Find the active workflow instance whose current state exposes the given
-   * tool name.  Returns null if no active instance has this tool available.
-   *
-   * Used by the OpenClaw plugin hooks to route beforeToolCall / afterToolCall
-   * events to the correct workflow instance without requiring the caller to
-   * supply an instanceId explicitly.
+   * Find the active workflow instance whose current state exposes the given tool name.
    */
   getActiveWorkflowForTool(toolName: string): WorkflowInstance | null {
     for (const workflowId of this.definitions.keys()) {
@@ -330,8 +317,6 @@ export class WorkflowEngine {
 
   /**
    * Validate a tool call without executing it.
-   * Checks availability in current state and Zod input schema only.
-   * Safe to call from the beforeToolCall hook (no side-effects, no transitions).
    */
   validateToolCall(
     instanceId: string,
@@ -348,18 +333,6 @@ export class WorkflowEngine {
 
   /**
    * Handle the result of a tool that was executed externally (OpenClaw plugin pattern).
-   *
-   * Unlike executeTool(), the tool has already run inside OpenClaw's native tool
-   * call pipeline.  This method mirrors the post-execution steps of executeTool():
-   *   1. Output validation against validationsByState[state][toolName] if defined
-   *   2. Logs a tool_succeeded audit event
-   *   3. Fires the onSuccess state transition (if configured for this tool)
-   *   4. Executes the read-after-write tool if requiresReadAfterWrite is set
-   *
-   * This method is async because step 4 (read-after-write) calls executeTool
-   * which may await external async tool handlers.
-   *
-   * Returns { success, newState, stateChanged, readResult?, error? }.
    */
   async handleToolResult(
     instanceId: string,
@@ -375,7 +348,6 @@ export class WorkflowEngine {
       return { success: false, stateChanged: false };
     }
 
-    // 1. Output validation (mirrors executeTool step 3)
     const outputValidator = this.machine.getOutputValidator(
       instanceId,
       toolName,
@@ -391,12 +363,10 @@ export class WorkflowEngine {
       }
     }
 
-    // 2. Audit
     this.persistence.logAudit(instanceId, "tool_succeeded", toolName, {
       result,
     });
 
-    // 3. Fire onSuccess transition if configured
     const prevState = this.machine.getCurrentState(instanceId)?.state;
     let newState = prevState;
     let stateChanged = false;
@@ -413,7 +383,6 @@ export class WorkflowEngine {
       }
     }
 
-    // 4. Read-after-write (mirrors executeTool step 6)
     if (toolDef.requiresReadAfterWrite && toolDef.readTool) {
       const rResult = await this.executeTool(instanceId, toolDef.readTool, {});
       if (!rResult.success) {
@@ -442,9 +411,351 @@ export class WorkflowEngine {
   }
 
   /**
-   * Close the database connection when done.
+   * Close database and executor connections.
    */
   close(): void {
+    this.sqlExecutor.closeAll();
     this.persistence.close();
+  }
+
+  private async executeTypedTool(
+    instanceId: string,
+    toolDef: ToolDefinition,
+    parsedInput: Record<string, unknown>,
+  ): Promise<ToolResult> {
+    let idempotencyKey: string | undefined;
+    if (toolDef.idempotencyKeyTemplate) {
+      let idempotencyResult;
+      try {
+        idempotencyResult = this.validation.checkIdempotency(
+          instanceId,
+          toolDef.name,
+          parsedInput,
+          toolDef.idempotencyKeyTemplate,
+        );
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.persistence.logAudit(instanceId, "validation_failed", toolDef.name, {
+          reason,
+          input: parsedInput,
+        });
+        return { success: false, error: reason };
+      }
+      idempotencyKey = idempotencyResult.key;
+      if (idempotencyResult.duplicate) {
+        this.persistence.logAudit(instanceId, "idempotency_hit", toolDef.name, {
+          idempotency_key: idempotencyResult.key,
+          input: parsedInput,
+        });
+        return {
+          success: true,
+          result: idempotencyResult.existingResult,
+          idempotencyHit: true,
+          newState: this.machine.getCurrentState(instanceId)?.state,
+        };
+      }
+    }
+
+    this.persistence.logAudit(instanceId, "tool_called", toolDef.name, {
+      input: parsedInput,
+    });
+
+    const auditPayload: Record<string, unknown> = { input: parsedInput };
+    if (idempotencyKey) auditPayload.idempotency_key = idempotencyKey;
+
+    const auditId = this.persistence.logAudit(
+      instanceId,
+      "tool_succeeded",
+      toolDef.name,
+      auditPayload,
+    );
+
+    let newState = this.machine.getCurrentState(instanceId)?.state;
+    if (toolDef.onSuccess) {
+      const transitionResult = this.machine.transition(
+        instanceId,
+        toolDef.onSuccess,
+        parsedInput,
+      );
+      if (!transitionResult.success) {
+        this.persistence.logAudit(instanceId, "transition_failed", toolDef.name, {
+          event: toolDef.onSuccess,
+          reason: transitionResult.reason,
+        });
+        return {
+          success: false,
+          error: `Transition '${toolDef.onSuccess}' failed: ${transitionResult.reason}`,
+        };
+      }
+      newState = transitionResult.newState;
+    }
+
+    const result: ToolResult = {
+      success: true,
+      result: parsedInput,
+      newState,
+      auditId,
+    };
+
+    if (toolDef.requiresReadAfterWrite && toolDef.readTool) {
+      const readResult = await this.executeTool(instanceId, toolDef.readTool, {});
+      if (!readResult.success) {
+        this.persistence.logAudit(
+          instanceId,
+          "read_after_write_failed",
+          toolDef.name,
+          {
+            readTool: toolDef.readTool,
+            error: readResult.error,
+          },
+        );
+        return {
+          success: false,
+          error: `Read-after-write failed (${toolDef.readTool}): ${readResult.error}`,
+        };
+      }
+      result.result = readResult.result;
+    }
+
+    return result;
+  }
+
+  private async executeYamlTool(
+    loaded: LoadedYamlWorkflow,
+    instanceId: string,
+    currentState: string,
+    toolDef: ToolDefinition,
+    parsedInput: Record<string, unknown>,
+  ): Promise<ToolResult> {
+    const stateName = this.topLevelState(currentState);
+    const runtimeTool = loaded.toolRuntimeByState[stateName]?.[toolDef.name];
+    if (!runtimeTool) {
+      return {
+        success: false,
+        error: `Runtime steps for tool '${toolDef.name}' not found in state '${stateName}'`,
+      };
+    }
+
+    const persisted = this.persistence.loadSnapshot(instanceId);
+    const context = persisted?.context ? JSON.parse(persisted.context) : {};
+
+    let idempotencyKey: string | undefined;
+    if (toolDef.idempotencyKeyTemplate) {
+      try {
+        idempotencyKey = this.buildYamlIdempotencyKey(
+          toolDef.idempotencyKeyTemplate,
+          parsedInput,
+          context,
+        );
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.persistence.logAudit(instanceId, "validation_failed", toolDef.name, {
+          reason,
+          input: parsedInput,
+        });
+        return { success: false, error: reason };
+      }
+
+      const existing = this.persistence.findByIdempotencyKey(
+        instanceId,
+        toolDef.name,
+        idempotencyKey,
+      );
+
+      if (existing.length > 0) {
+        const payload = JSON.parse(existing[0].payload);
+        const existingResult =
+          payload && typeof payload === "object" && "result" in payload
+            ? (payload as Record<string, unknown>).result
+            : payload;
+
+        this.persistence.logAudit(instanceId, "idempotency_hit", toolDef.name, {
+          idempotency_key: idempotencyKey,
+          input: parsedInput,
+        });
+
+        return {
+          success: true,
+          idempotencyHit: true,
+          result: existingResult,
+          newState: this.machine.getCurrentState(instanceId)?.state,
+        };
+      }
+    }
+
+    this.persistence.logAudit(instanceId, "tool_called", toolDef.name, {
+      input: parsedInput,
+    });
+
+    const stepExecutor = this.createStepExecutor(loaded, instanceId);
+    const stepResult = await stepExecutor.executeSteps(
+      runtimeTool.steps,
+      parsedInput,
+      context,
+      toolDef.name,
+    );
+
+    if (stepResult.error) {
+      const errorMessage = this.resolveOnErrorMessage(
+        runtimeTool.onError,
+        stepResult.error.message,
+      );
+      this.persistence.logAudit(instanceId, "tool_failed", toolDef.name, {
+        input: parsedInput,
+        step: stepResult.error.step,
+        error: errorMessage,
+      });
+      return { success: false, error: errorMessage };
+    }
+
+    let newState = this.machine.getCurrentState(instanceId)?.state;
+    if (stepResult.transition) {
+      const transition = this.machine.transition(
+        instanceId,
+        stepResult.transition,
+        {},
+      );
+      if (!transition.success) {
+        this.persistence.logAudit(instanceId, "transition_failed", toolDef.name, {
+          event: stepResult.transition,
+          reason: transition.reason,
+        });
+        return {
+          success: false,
+          error: `Transition '${stepResult.transition}' failed: ${transition.reason}`,
+        };
+      }
+      newState = transition.newState;
+    }
+
+    if (stepResult.contextUpdated) {
+      this.persistence.updateContext(instanceId, context);
+    }
+
+    const resultPayload = stepResult.returned ? stepResult.data : stepResult.results;
+    const auditPayload: Record<string, unknown> = {
+      input: parsedInput,
+      result: resultPayload,
+    };
+    if (idempotencyKey) {
+      auditPayload.idempotency_key = idempotencyKey;
+    }
+
+    const auditId = this.persistence.logAudit(
+      instanceId,
+      "tool_succeeded",
+      toolDef.name,
+      auditPayload,
+    );
+
+    const response: ToolResult = {
+      success: true,
+      result: resultPayload,
+      newState,
+      auditId,
+    };
+
+    if (toolDef.requiresReadAfterWrite && toolDef.readTool) {
+      const read = await this.executeTool(instanceId, toolDef.readTool, {});
+      if (!read.success) {
+        this.persistence.logAudit(
+          instanceId,
+          "read_after_write_failed",
+          toolDef.name,
+          {
+            readTool: toolDef.readTool,
+            error: read.error,
+          },
+        );
+        return {
+          success: false,
+          error: `Read-after-write failed (${toolDef.readTool}): ${read.error}`,
+        };
+      }
+      response.result = read.result;
+    }
+
+    return response;
+  }
+
+  private createStepExecutor(
+    loaded: LoadedYamlWorkflow,
+    instanceId?: string,
+  ): StepExecutor {
+    return new StepExecutor({
+      sql: this.sqlExecutor,
+      http: this.httpExecutor,
+      workflowConfig: {
+        db: loaded.config.db,
+        api_base: loaded.config.api_base,
+      },
+      instanceId,
+      logAudit: (eventType, payload, toolName, id) => {
+        this.persistence.logAudit(id ?? null, eventType, toolName, payload);
+      },
+    });
+  }
+
+  private applyMigrations(loaded: LoadedYamlWorkflow): number[] {
+    const migrations = [...(loaded.config.migrations ?? [])].sort(
+      (a, b) => a.version - b.version,
+    );
+
+    const applied = new Set(
+      this.persistence.getAppliedMigrations(loaded.definition.id),
+    );
+
+    const newlyApplied: number[] = [];
+    for (const migration of migrations) {
+      if (applied.has(migration.version)) continue;
+
+      const marker = this.sqlExecutor.executeScript(
+        migration.sql,
+        loaded.config.db,
+      );
+      if (marker.error) {
+        throw new Error(
+          `Migration ${migration.version} failed for workflow '${loaded.definition.id}': ${marker.message}`,
+        );
+      }
+
+      this.persistence.markMigrationApplied(loaded.definition.id, migration.version);
+      newlyApplied.push(migration.version);
+    }
+
+    return newlyApplied;
+  }
+
+  private buildYamlIdempotencyKey(
+    template: string,
+    input: Record<string, unknown>,
+    context: Record<string, unknown>,
+  ): string {
+    return template.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, key: string) => {
+      const value = key in input ? input[key] : context[key];
+      if (value === undefined || value === null) {
+        throw new Error(`Idempotency key template field '${key}' is missing`);
+      }
+      return String(value);
+    });
+  }
+
+  private resolveOnErrorMessage(
+    template: string | undefined,
+    message: string,
+  ): string {
+    if (!template) return message;
+    const scope: TemplateScope = { error: { message } };
+    try {
+      const resolved = resolveTemplate(template, scope);
+      return typeof resolved === "string" ? resolved : message;
+    } catch {
+      return message;
+    }
+  }
+
+  private topLevelState(state: string): string {
+    const dot = state.indexOf(".");
+    return dot === -1 ? state : state.slice(0, dot);
   }
 }

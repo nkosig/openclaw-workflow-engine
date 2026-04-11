@@ -17,6 +17,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { WorkflowEngine } from "./engine.js";
 import type { WorkflowDefinition } from "./types.js";
+import { loadWorkflowFromYaml } from "./config/loader.js";
 
 /** Handle returned by McpServer.tool() — only the subset we need */
 interface RegisteredHandle {
@@ -107,6 +108,40 @@ export class WorkflowMCPServer {
    */
   async connect(transport: Transport): Promise<void> {
     if (this.workflowsDir !== null && this.definitions.size === 0) {
+      const absDir = resolve(this.workflowsDir);
+      try {
+        const entries = readdirSync(absDir);
+        for (const entry of entries) {
+          if (!entry.endsWith(".yaml") && !entry.endsWith(".yml")) continue;
+          const filePath = resolve(absDir, entry);
+          try {
+            const loaded = loadWorkflowFromYaml(filePath);
+            this.engine.registerWorkflowFromYaml(filePath);
+            this.definitions.set(
+              loaded.definition.id,
+              this.engine.getDefinition(loaded.definition.id) ??
+                loaded.definition,
+            );
+            const existing = this.engine.getActiveWorkflow(loaded.definition.id);
+            if (existing) {
+              this.activeInstances.set(loaded.definition.id, existing.instanceId);
+              this._syncDynamicTools(loaded.definition.id, existing.instanceId);
+            }
+            if (this.workflowsDirExplicit) {
+              process.stderr.write(
+                `[workflow-engine] Loaded YAML workflow: ${loaded.definition.id}\n`,
+              );
+            }
+          } catch (err) {
+            process.stderr.write(
+              `[workflow-engine] Warning: failed to load YAML workflow ${filePath}: ${err}\n`,
+            );
+          }
+        }
+      } catch {
+        // keep existing behavior below for silent/missing-dir handling
+      }
+
       const defs = await loadWorkflowsFromDir(this.workflowsDir, {
         silent: !this.workflowsDirExplicit,
       });

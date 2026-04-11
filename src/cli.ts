@@ -12,11 +12,14 @@
  */
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
+import { readdirSync } from "node:fs";
+import { resolve } from "node:path";
 import { program } from "commander";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { WorkflowMCPServer, loadWorkflowsFromDir } from "./mcp-server.js";
 import { WorkflowEngine } from "./engine.js";
+import { loadWorkflowFromYaml } from "./config/loader.js";
 
 // ─── CLI definition ────────────────────────────────────────────────────────
 
@@ -27,6 +30,27 @@ program
   .name("workflow-engine")
   .version(pkg.version ?? "0.0.0")
   .description("OpenClaw Workflow Engine — MCP server & CLI tools");
+
+async function registerWorkflowsFromDir(
+  engine: WorkflowEngine,
+  workflowsDir: string,
+): Promise<void> {
+  const absDir = resolve(workflowsDir);
+  try {
+    const entries = readdirSync(absDir);
+    for (const entry of entries) {
+      if (!entry.endsWith(".yaml") && !entry.endsWith(".yml")) continue;
+      engine.registerWorkflowFromYaml(resolve(absDir, entry));
+    }
+  } catch {
+    // handled by JS loader warning path
+  }
+
+  const definitions = await loadWorkflowsFromDir(workflowsDir, { silent: true });
+  for (const def of definitions) {
+    engine.registerWorkflow(def);
+  }
+}
 
 // ── serve ─────────────────────────────────────────────────────────────────
 program
@@ -134,14 +158,13 @@ program
   .option("-d, --db <path>", "SQLite database path", "./workflow.db")
   .action(async (opts: { workflows: string; db: string }) => {
     const engine = new WorkflowEngine(opts.db);
-    const definitions = await loadWorkflowsFromDir(opts.workflows);
+    await registerWorkflowsFromDir(engine, opts.workflows);
 
     const result = [];
-    for (const def of definitions) {
-      engine.registerWorkflow(def);
-      const active = engine.getActiveWorkflow(def.id);
+    for (const workflowId of engine.getRegisteredWorkflowIds()) {
+      const active = engine.getActiveWorkflow(workflowId);
       result.push({
-        workflowId: def.id,
+        workflowId,
         instanceId: active?.instanceId ?? null,
         currentState: active?.currentState ?? null,
       });
@@ -164,8 +187,7 @@ program
   .action(
     async (instanceId: string, opts: { workflows: string; db: string }) => {
       const engine = new WorkflowEngine(opts.db);
-      const definitions = await loadWorkflowsFromDir(opts.workflows);
-      for (const def of definitions) engine.registerWorkflow(def);
+      await registerWorkflowsFromDir(engine, opts.workflows);
 
       try {
         const status = engine.getStatus(instanceId);
@@ -204,12 +226,75 @@ program
       opts: { workflows: string; db: string; limit: string },
     ) => {
       const engine = new WorkflowEngine(opts.db);
-      const definitions = await loadWorkflowsFromDir(opts.workflows);
-      for (const def of definitions) engine.registerWorkflow(def);
+      await registerWorkflowsFromDir(engine, opts.workflows);
 
       try {
         const log = engine.getAuditLog(instanceId, parseInt(opts.limit, 10));
         process.stdout.write(JSON.stringify(log, null, 2) + "\n");
+      } catch (err) {
+        process.stderr.write(`Error: ${err}\n`);
+        process.exitCode = 1;
+      } finally {
+        engine.close();
+      }
+    },
+  );
+
+// ── validate ──────────────────────────────────────────────────────────────
+program
+  .command("validate <file>")
+  .description("Parse and validate a YAML workflow file")
+  .action((file: string) => {
+    try {
+      const loaded = loadWorkflowFromYaml(file);
+      const out = {
+        valid: true,
+        workflowId: loaded.definition.id,
+        states: Object.keys(loaded.config.states),
+        warnings: loaded.warnings,
+      };
+      process.stdout.write(JSON.stringify(out, null, 2) + "\n");
+    } catch (err) {
+      process.stderr.write(`Error: ${err}\n`);
+      process.exitCode = 1;
+    }
+  });
+
+// ── migrate ───────────────────────────────────────────────────────────────
+program
+  .command("migrate <file>")
+  .description("Run pending migrations for a YAML workflow")
+  .option("-d, --db <path>", "SQLite database path", "./workflow.db")
+  .action((file: string, opts: { db: string }) => {
+    const engine = new WorkflowEngine(opts.db);
+    try {
+      const result = engine.runMigrationsForYaml(file);
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } catch (err) {
+      process.stderr.write(`Error: ${err}\n`);
+      process.exitCode = 1;
+    } finally {
+      engine.close();
+    }
+  });
+
+// ── dry-run ───────────────────────────────────────────────────────────────
+program
+  .command("dry-run <file>")
+  .description("Execute a YAML workflow tool without state transitions")
+  .requiredOption("--tool <name>", "Tool name to execute")
+  .requiredOption("--input <json>", "JSON input object")
+  .option("-d, --db <path>", "SQLite database path", "./workflow.db")
+  .action(
+    async (
+      file: string,
+      opts: { tool: string; input: string; db: string },
+    ) => {
+      const engine = new WorkflowEngine(opts.db);
+      try {
+        const input = JSON.parse(opts.input) as Record<string, unknown>;
+        const result = await engine.dryRunYamlTool(file, opts.tool, input);
+        process.stdout.write(JSON.stringify(result, null, 2) + "\n");
       } catch (err) {
         process.stderr.write(`Error: ${err}\n`);
         process.exitCode = 1;

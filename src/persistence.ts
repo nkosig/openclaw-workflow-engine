@@ -36,6 +36,13 @@ CREATE TABLE IF NOT EXISTS workflow_audit_log (
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS workflow_migrations (
+  workflow_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (workflow_id, version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_audit_idempotency
 ON workflow_audit_log (instance_id, tool_name, json_extract(payload, '$.idempotency_key'));
 `
@@ -281,6 +288,50 @@ export class PersistenceLayer {
         LIMIT 1
       `)
       .all(instanceId, toolName, key) as Array<{ id: number; payload: string }>
+  }
+
+  /**
+   * Persist only the context JSON for an existing workflow instance.
+   */
+  updateContext(instanceId: string, context: Record<string, unknown>): void {
+    const result = this.db
+      .prepare(`
+        UPDATE workflow_instances
+        SET context = ?, updated_at = datetime('now')
+        WHERE instance_id = ?
+      `)
+      .run(JSON.stringify(context), instanceId)
+
+    if (result.changes === 0) {
+      throw new Error(`Instance '${instanceId}' not found`)
+    }
+  }
+
+  /**
+   * Return migration versions already applied for a workflow.
+   */
+  getAppliedMigrations(workflowId: string): number[] {
+    return this.db
+      .prepare(`
+        SELECT version
+        FROM workflow_migrations
+        WHERE workflow_id = ?
+        ORDER BY version ASC
+      `)
+      .all(workflowId)
+      .map((r) => (r as { version: number }).version)
+  }
+
+  /**
+   * Record one applied migration version.
+   */
+  markMigrationApplied(workflowId: string, version: number): void {
+    this.db
+      .prepare(`
+        INSERT OR IGNORE INTO workflow_migrations (workflow_id, version)
+        VALUES (?, ?)
+      `)
+      .run(workflowId, version)
   }
 
   /**
