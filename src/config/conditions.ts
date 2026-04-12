@@ -6,7 +6,8 @@ interface Token {
 }
 
 /**
- * Evaluate a workflow condition safely without eval().
+ * Evaluate a workflow condition using a safe recursive-descent parser.
+ * No dynamic code execution — expressions are parsed and walked as an AST.
  */
 export function evaluateCondition(
   expression: string,

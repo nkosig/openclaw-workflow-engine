@@ -293,7 +293,7 @@ program
       const engine = new WorkflowEngine(opts.db);
       try {
         const input = JSON.parse(opts.input) as Record<string, unknown>;
-        const result = await engine.dryRunYamlTool(file, opts.tool, input);
+        const result = await engine.dryRunYamlTool(file, opts.tool, input, opts.db);
         process.stdout.write(JSON.stringify(result, null, 2) + "\n");
       } catch (err) {
         process.stderr.write(`Error: ${err}\n`);

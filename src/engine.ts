@@ -49,8 +49,16 @@ export class WorkflowEngine {
 
   /**
    * Register a TypeScript workflow definition so it can be started via startWorkflow().
+   * Throws if a workflow with the same ID is already registered — prevents silent
+   * YAML/JS double-load collisions.
    */
   registerWorkflow(definition: WorkflowDefinition): void {
+    if (this.definitions.has(definition.id)) {
+      throw new Error(
+        `Workflow '${definition.id}' is already registered. ` +
+          `Remove the duplicate definition (check for both .yaml and .js files with the same workflow id).`,
+      );
+    }
     this.machine.registerDefinition(definition);
     this.definitions.set(definition.id, definition);
   }
@@ -87,13 +95,18 @@ export class WorkflowEngine {
 
   /**
    * Execute one YAML-defined tool as a dry run (without starting/transitioning an instance).
+   * @param dbOverride - Override the workflow's `db:` field (e.g. for CLI --db flag).
    */
   async dryRunYamlTool(
     filePath: string,
     toolName: string,
     input: Record<string, unknown>,
+    dbOverride?: string,
   ): Promise<Record<string, unknown>> {
     const loaded = loadWorkflowFromYaml(filePath);
+    if (dbOverride) {
+      loaded.config.db = dbOverride;
+    }
     const candidate = Object.entries(loaded.definition.toolsByState)
       .flatMap(([stateName, tools]) => tools.map((tool) => ({ stateName, tool })))
       .find(({ tool }) => tool.name === toolName);

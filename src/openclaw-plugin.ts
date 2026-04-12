@@ -95,10 +95,16 @@ export interface ToolGuardResult {
 export interface OpenClawPluginApi {
   /** Configuration values from openclaw.plugin.json under `configuration` */
   config: PluginConfig;
-  /** Register a long-running background service */
-  registerService(name: string, service: ServiceInstance): void;
-  /** Register a tool that appears in the agent's tool list */
-  registerTool(name: string, tool: ToolRegistration): void;
+  /**
+   * Register a long-running background service.
+   * OpenClaw 2026.4.x: single object argument; service.id is used as the key.
+   */
+  registerService(service: ServiceInstance): void;
+  /**
+   * Register a tool that appears in the agent's tool list.
+   * OpenClaw 2026.4.x: single object argument; tool.name is used as the key.
+   */
+  registerTool(tool: ToolRegistration): void;
   /** Register a beforePromptConstruct hook */
   registerHook(
     event: "beforePromptConstruct",
@@ -160,8 +166,14 @@ async function registerWorkflowsFromDirectory(
     silent: true,
   });
   for (const def of defs) {
-    engine.registerWorkflow(def);
-    process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
+    try {
+      engine.registerWorkflow(def);
+      process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `[workflow-engine] Skipping duplicate workflow '${def.id}': ${err}\n`,
+      );
+    }
   }
 }
 
@@ -254,7 +266,7 @@ export default function register(api: OpenClawPluginApi): void {
   if (typeof api.registerService === "function") {
     log("registerService…");
     try {
-      api.registerService(service.id, service);
+      api.registerService(service);
       log("registerService ok");
     } catch (e) {
       log(`registerService threw: ${e} — skipping service lifecycle`);
@@ -270,7 +282,7 @@ export default function register(api: OpenClawPluginApi): void {
   const tryRegisterTool = (tool: ToolRegistration) => {
     log(`registerTool ${tool.name}…`);
     try {
-      api.registerTool(tool.name, tool);
+      api.registerTool(tool);
       log(`registerTool ${tool.name} ok`);
     } catch (e) {
       const stack = e instanceof Error

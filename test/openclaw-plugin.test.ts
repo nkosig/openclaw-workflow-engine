@@ -84,12 +84,12 @@ class MockOpenClawApi implements OpenClawPluginApi {
     this.config = config;
   }
 
-  registerService(name: string, service: ServiceInstance): void {
-    this.services.set(name, service);
+  registerService(service: ServiceInstance): void {
+    this.services.set(service.id, service);
   }
 
-  registerTool(name: string, options: ToolRegistration): void {
-    this.tools.set(name, options);
+  registerTool(tool: ToolRegistration): void {
+    this.tools.set(tool.name, tool);
   }
 
   // Single implementation satisfies all three registerHook overloads

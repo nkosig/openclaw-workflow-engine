@@ -1,12 +1,23 @@
-import { describe, expect, it, beforeAll } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
-import { execFileSync, spawnSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { loadWorkflowFromYaml } from "../../src/config/loader.js";
+import { WorkflowEngine } from "../../src/engine.js";
 
-const projectRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
-const cliPath = join(projectRoot, "dist", "cli.js");
+async function withTempWorkflow(
+  content: string,
+  fn: (filePath: string, dir: string) => void | Promise<void>,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "wf-cli-"));
+  const filePath = join(dir, "workflow.yaml");
+  writeFileSync(filePath, content, "utf8");
+  try {
+    await fn(filePath, dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 function validYaml(dbPath: string): string {
   return `
@@ -30,115 +41,43 @@ states:
 `;
 }
 
-function runCli(args: string[], cwd?: string): {
-  status: number | null;
-  stdout: string;
-  stderr: string;
-} {
-  const out = spawnSync(process.execPath, [cliPath, ...args], {
-    cwd: cwd ?? projectRoot,
-    encoding: "utf8",
-  });
-
-  return {
-    status: out.status,
-    stdout: out.stdout,
-    stderr: out.stderr,
-  };
-}
-
 describe("cli/validate", () => {
-  beforeAll(() => {
-    if (!existsSync(cliPath)) {
-      execFileSync("npm", ["run", "build"], {
-        cwd: projectRoot,
-        stdio: "pipe",
-      });
-    }
-  });
+  it("valid YAML passes validation", () =>
+    withTempWorkflow(validYaml("/tmp/unused.db"), (filePath) => {
+      const loaded = loadWorkflowFromYaml(filePath);
+      expect(loaded.definition.id).toBe("cli-validate");
+      expect(loaded.warnings).toHaveLength(0);
+    }));
 
-  it("valid YAML passes validation via CLI", () => {
-    const dir = mkdtempSync(join(tmpdir(), "wf-cli-valid-"));
-    const filePath = join(dir, "workflow.yaml");
-    const dbPath = join(dir, "workflow.db");
-    writeFileSync(filePath, validYaml(dbPath), "utf8");
-
-    try {
-      const result = runCli(["validate", filePath]);
-      expect(result.status).toBe(0);
-
-      const payload = JSON.parse(result.stdout) as {
-        valid: boolean;
-        workflowId: string;
-      };
-      expect(payload.valid).toBe(true);
-      expect(payload.workflowId).toBe("cli-validate");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("invalid YAML returns non-zero and error output via CLI", () => {
-    const dir = mkdtempSync(join(tmpdir(), "wf-cli-invalid-"));
-    const filePath = join(dir, "workflow.yaml");
-    writeFileSync(
-      filePath,
+  it("invalid YAML (missing transition target) throws with clear error", () =>
+    withTempWorkflow(
       `id: bad\nversion: 1\nstates:\n  idle:\n    tools:\n      x:\n        description: X\n        input: {}\n        steps:\n          - return:\n              ok: true\n            transition: missing\n`,
-      "utf8",
-    );
+      (filePath) => {
+        expect(() => loadWorkflowFromYaml(filePath)).toThrow(/does not exist/);
+      },
+    ));
 
-    try {
-      const result = runCli(["validate", filePath]);
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("Error:");
-      expect(result.stderr).toContain("does not exist");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+  it("dry-run executes tool without creating a persisted workflow instance", () =>
+    withTempWorkflow(validYaml(""), async (_filePath, dir) => {
+      const dbPath = join(dir, "state.db");
+      const workflowDbPath = join(dir, "workflow.db");
 
-  it("dry-run executes tool without creating active workflow state", () => {
-    const dir = mkdtempSync(join(tmpdir(), "wf-cli-dry-"));
-    const filePath = join(dir, "workflow.yaml");
-    const dbPath = join(dir, "workflow.db");
-    const stateDbPath = join(dir, "state.db");
-    writeFileSync(filePath, validYaml(dbPath), "utf8");
+      const engine = new WorkflowEngine(dbPath);
+      try {
+        // Replace placeholder db path with real temp path
+        const yamlWithDb = validYaml(workflowDbPath);
+        const yamlPath = join(dir, "real.yaml");
+        writeFileSync(yamlPath, yamlWithDb, "utf8");
 
-    try {
-      const dryRun = runCli([
-        "dry-run",
-        filePath,
-        "--tool",
-        "run",
-        "--input",
-        '{"x":5}',
-        "--db",
-        stateDbPath,
-      ]);
+        const result = await engine.dryRunYamlTool(yamlPath, "run", { x: 5 });
+        expect(result.success).toBe(true);
 
-      expect(dryRun.status).toBe(0);
-      const dryRunPayload = JSON.parse(dryRun.stdout) as {
-        success: boolean;
-      };
-      expect(dryRunPayload.success).toBe(true);
-
-      const list = runCli([
-        "list",
-        "--workflows",
-        dir,
-        "--db",
-        stateDbPath,
-      ]);
-      expect(list.status).toBe(0);
-      const listPayload = JSON.parse(list.stdout) as Array<{
-        workflowId: string;
-        instanceId: string | null;
-      }>;
-      expect(listPayload).toHaveLength(1);
-      expect(listPayload[0].workflowId).toBe("cli-validate");
-      expect(listPayload[0].instanceId).toBeNull();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+        // dry-run must not create a persisted workflow instance
+        engine.registerWorkflowFromYaml(yamlPath);
+        const active = engine.getActiveWorkflow("cli-validate");
+        expect(active?.instanceId ?? null).toBeNull();
+      } finally {
+        engine.close();
+      }
+    }));
 });

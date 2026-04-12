@@ -146,10 +146,16 @@ export class WorkflowMCPServer {
         silent: !this.workflowsDirExplicit,
       });
       for (const def of defs) {
-        this.registerWorkflow(def);
-        if (this.workflowsDirExplicit) {
+        try {
+          this.registerWorkflow(def);
+          if (this.workflowsDirExplicit) {
+            process.stderr.write(
+              `[workflow-engine] Loaded workflow: ${def.id}\n`,
+            );
+          }
+        } catch (err) {
           process.stderr.write(
-            `[workflow-engine] Loaded workflow: ${def.id}\n`,
+            `[workflow-engine] Skipping duplicate workflow '${def.id}': ${err}\n`,
           );
         }
       }

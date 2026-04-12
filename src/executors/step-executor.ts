@@ -253,7 +253,6 @@ export class StepExecutor {
       context,
       env: process.env,
       api_base: this.apiBase,
-      template: (context as Record<string, unknown>)["template"],
     };
   }
 }
