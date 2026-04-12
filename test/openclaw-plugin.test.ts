@@ -67,6 +67,111 @@ const testWorkflow: WorkflowDefinition = {
   },
 };
 
+const workoutWorkflow: WorkflowDefinition = {
+  id: "workout-coach",
+  machine: createMachine({
+    id: "workoutCoach",
+    initial: "idle",
+    states: {
+      idle: { on: { GET_NEXT_WORKOUT: "showing_next_workout" } },
+      showing_next_workout: {
+        on: {
+          START_SESSION: "exercise_active",
+          CANCEL: "cancelled",
+        },
+      },
+      exercise_active: {
+        on: {
+          LOG_SET: "exercise_active",
+          SKIP_EXERCISE: "exercise_active",
+          FINISH: "workout_completed",
+          CANCEL: "cancelled",
+        },
+      },
+      workout_completed: { type: "final" },
+      cancelled: { type: "final" },
+    },
+  }),
+  toolsByState: {
+    idle: [
+      {
+        name: "get_next_workout",
+        description: "Get next workout",
+        inputSchema: z.object({}),
+        onSuccess: "GET_NEXT_WORKOUT",
+      },
+    ],
+    showing_next_workout: [
+      {
+        name: "start_workout_session",
+        description: "Start workout session",
+        inputSchema: z.object({
+          template_id: z.string(),
+          idempotency_key: z.string(),
+        }),
+        onSuccess: "START_SESSION",
+      },
+      {
+        name: "get_current_session",
+        description: "Get active session",
+        inputSchema: z.object({}),
+      },
+      {
+        name: "cancel_workout_session",
+        description: "Cancel workout session",
+        inputSchema: z.object({
+          reason: z.string().optional(),
+        }),
+        onSuccess: "CANCEL",
+      },
+    ],
+    exercise_active: [
+      {
+        name: "get_current_session",
+        description: "Get active session",
+        inputSchema: z.object({}),
+      },
+      {
+        name: "log_set",
+        description: "Log set",
+        inputSchema: z.object({
+          weight_kg: z.number().positive(),
+          reps: z.number().int().positive(),
+          rpe: z.number().min(1).max(10).optional(),
+          idempotency_key: z.string(),
+        }),
+        requiresReadAfterWrite: true,
+        readTool: "get_current_session",
+        onSuccess: "LOG_SET",
+      },
+      {
+        name: "skip_exercise",
+        description: "Skip exercise",
+        inputSchema: z.object({
+          reason: z.string().optional(),
+        }),
+        onSuccess: "SKIP_EXERCISE",
+      },
+      {
+        name: "finish_workout_session",
+        description: "Finish workout",
+        inputSchema: z.object({}),
+        onSuccess: "FINISH",
+      },
+      {
+        name: "cancel_workout_session",
+        description: "Cancel workout session",
+        inputSchema: z.object({
+          reason: z.string().optional(),
+        }),
+        onSuccess: "CANCEL",
+      },
+    ],
+    workout_completed: [],
+    cancelled: [],
+  },
+};
+
 // ── Mock OpenClaw Plugin API ───────────────────────────────────────────────────
 
 type HookName = "beforePromptConstruct" | "beforeToolCall" | "afterToolCall";
@@ -131,7 +236,8 @@ class MockOpenClawApi implements OpenClawPluginApi {
 async function createCtx(extraConfig: PluginConfig = {}): Promise<{
   api: MockOpenClawApi;
   service: WorkflowServiceInstance;
-}> {
+}> 
+{
   const api = new MockOpenClawApi({
     dbPath: ":memory:",
     // Nonexistent path → loadWorkflowsFromDir returns [] silently
@@ -154,9 +260,16 @@ async function createCtx(extraConfig: PluginConfig = {}): Promise<{
 // ── Registration tests ─────────────────────────────────────────────────────────
 
 describe("openclaw-plugin — registration", () => {
-  it("registers exactly five control tools", async () => {
+  it("registers control tools plus direct workout tools", async () => {
     const { api } = await createCtx();
     expect([...api.tools.keys()].sort()).toEqual([
+      "cancel_workout_session",
+      "finish_workout_session",
+      "get_current_session",
+      "get_next_workout",
+      "log_set",
+      "skip_exercise",
+      "start_workout_session",
       "workflow_audit",
       "workflow_list",
       "workflow_reset",
@@ -259,14 +372,15 @@ describe("openclaw-plugin — control tools", () => {
 // ── beforePromptConstruct hook tests ──────────────────────────────────────────
 
 describe("openclaw-plugin — beforePromptConstruct hook", () => {
-  it("does not modify systemPrompt when no active instance exists", async () => {
+  it("injects a short workout bootstrap hint when no workout instance exists", async () => {
     const { api } = await createCtx();
     const ctx: PromptConstructContext = { systemPrompt: "Base prompt." };
     const result = await api.callHook<PromptConstructContext>(
       "beforePromptConstruct",
       ctx,
     );
-    expect(result.systemPrompt).toBe("Base prompt.");
+    expect(result.systemPrompt).toContain("## Workout Coaching");
+    expect(result.systemPrompt).toContain("call get_next_workout");
   });
 
   it("injects state-specific prompt fragment for an active instance", async () => {
@@ -295,6 +409,58 @@ describe("openclaw-plugin — beforePromptConstruct hook", () => {
     );
     expect(result.systemPrompt).toContain("Current state: step_b");
     expect(result.systemPrompt).toContain("You are in step B.");
+  });
+});
+
+describe("openclaw-plugin — direct workout tool proxy", () => {
+  it("get_next_workout auto-starts workout-coach and transitions idle → showing_next_workout", async () => {
+    const { api, service } = await createCtx();
+    service.engine.registerWorkflow(workoutWorkflow);
+
+    const result = (await api.callTool("get_next_workout", {})) as {
+      success?: boolean;
+      error?: boolean;
+      message?: string;
+      newState?: string;
+    };
+
+    expect(result.error).not.toBe(true);
+    expect(result.success).toBe(true);
+    expect(result.newState).toBe("showing_next_workout");
+
+    const active = service.engine.getActiveWorkflow("workout-coach");
+    expect(active).not.toBeNull();
+    expect(active?.currentState).toBe("showing_next_workout");
+  });
+
+  it("start_workout_session fails cleanly when there is no active workout instance", async () => {
+    const { api, service } = await createCtx();
+    service.engine.registerWorkflow(workoutWorkflow);
+
+    const result = (await api.callTool("start_workout_session", {
+      template_id: "push-a",
+      idempotency_key: "k1",
+    })) as { error?: boolean; message?: string };
+
+    expect(result.error).toBe(true);
+    expect(result.message).toContain(
+      "No active workflow instance for workout-coach",
+    );
+  });
+
+  it("start_workout_session succeeds after bootstrap via get_next_workout", async () => {
+    const { api, service } = await createCtx();
+    service.engine.registerWorkflow(workoutWorkflow);
+
+    await api.callTool("get_next_workout", {});
+    const result = (await api.callTool("start_workout_session", {
+      template_id: "push-a",
+      idempotency_key: "k1",
+    })) as { success?: boolean; error?: boolean; newState?: string };
+
+    expect(result.error).not.toBe(true);
+    expect(result.success).toBe(true);
+    expect(result.newState).toBe("exercise_active");
   });
 });
 

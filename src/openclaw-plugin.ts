@@ -4,6 +4,9 @@
  * Registers the workflow engine as a first-class OpenClaw plugin with:
  *   - Five control tools  (workflow_list, workflow_start, workflow_status,
  *                          workflow_reset, workflow_audit)
+ *   - Seven direct workout tools (get_next_workout, start_workout_session,
+ *                                 get_current_session, log_set, skip_exercise,
+ *                                 finish_workout_session, cancel_workout_session)
  *   - Three lifecycle hooks (beforePromptConstruct, beforeToolCall, afterToolCall)
  *   - An optional HTTP dashboard
  *   - An MCP server side-car for portable external access
@@ -292,6 +295,53 @@ export default function register(api: OpenClawPluginApi): void {
     }
   };
 
+  const executeWorkflowTool = async (
+    workflowId: string,
+    toolName: string,
+    input: Record<string, unknown>,
+    opts?: { autoStart?: boolean },
+  ): Promise<unknown> => {
+    let active = engine.getActiveWorkflow(workflowId);
+
+    if (!active && opts?.autoStart) {
+      try {
+        active = engine.startWorkflow(workflowId, {});
+      } catch (error) {
+        return {
+          error: true,
+          message: `Failed to start workflow '${workflowId}': ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
+
+    if (!active) {
+      return {
+        error: true,
+        message: `No active workflow instance for ${workflowId}`,
+      };
+    }
+
+    const validation = engine.validateToolCall(active.instanceId, toolName, input);
+    if (!validation.valid) {
+      return {
+        error: true,
+        message:
+          validation.reason ??
+          `Tool '${toolName}' is not valid in the current state`,
+      };
+    }
+
+    const result = await engine.executeTool(active.instanceId, toolName, input);
+    if (!result.success) {
+      return {
+        error: true,
+        message: result.error ?? `Tool '${toolName}' execution failed`,
+      };
+    }
+
+    return result;
+  };
+
   tryRegisterTool({
     name: "workflow_list",
     description: "List all registered workflows and their current status",
@@ -384,6 +434,113 @@ export default function register(api: OpenClawPluginApi): void {
     },
   });
 
+  tryRegisterTool({
+    name: "get_next_workout",
+    description: "Get the next workout in rotation or resume an active workout session",
+    inputSchema: {},
+    async handler() {
+      return executeWorkflowTool("workout-coach", "get_next_workout", {}, { autoStart: true });
+    },
+  });
+
+  tryRegisterTool({
+    name: "start_workout_session",
+    description: "Start a workout session from the selected template",
+    inputSchema: {
+      template_id: {
+        type: "string",
+        required: true,
+        description: "Workout template id",
+      },
+      idempotency_key: {
+        type: "string",
+        required: true,
+        description: "Unique idempotency key",
+      },
+    },
+    async handler(input) {
+      return executeWorkflowTool("workout-coach", "start_workout_session", input);
+    },
+  });
+
+  tryRegisterTool({
+    name: "get_current_session",
+    description: "Get the current workout session state",
+    inputSchema: {},
+    async handler() {
+      return executeWorkflowTool("workout-coach", "get_current_session", {});
+    },
+  });
+
+  tryRegisterTool({
+    name: "log_set",
+    description: "Log a completed set for the active workout session",
+    inputSchema: {
+      weight_kg: {
+        type: "number",
+        required: true,
+        description: "Weight in kilograms",
+      },
+      reps: {
+        type: "integer",
+        required: true,
+        description: "Repetitions completed",
+      },
+      rpe: {
+        type: "number",
+        required: false,
+        description: "Rate of perceived exertion (1-10)",
+      },
+      idempotency_key: {
+        type: "string",
+        required: true,
+        description: "Unique idempotency key for this set",
+      },
+    },
+    async handler(input) {
+      return executeWorkflowTool("workout-coach", "log_set", input);
+    },
+  });
+
+  tryRegisterTool({
+    name: "skip_exercise",
+    description: "Skip the current exercise in the active workout session",
+    inputSchema: {
+      reason: {
+        type: "string",
+        required: false,
+        description: "Optional reason for skipping the exercise",
+      },
+    },
+    async handler(input) {
+      return executeWorkflowTool("workout-coach", "skip_exercise", input);
+    },
+  });
+
+  tryRegisterTool({
+    name: "finish_workout_session",
+    description: "Complete the active workout session",
+    inputSchema: {},
+    async handler() {
+      return executeWorkflowTool("workout-coach", "finish_workout_session", {});
+    },
+  });
+
+  tryRegisterTool({
+    name: "cancel_workout_session",
+    description: "Cancel the active workout session",
+    inputSchema: {
+      reason: {
+        type: "string",
+        required: false,
+        description: "Optional reason for cancelling",
+      },
+    },
+    async handler(input) {
+      return executeWorkflowTool("workout-coach", "cancel_workout_session", input);
+    },
+  });
+
   // ── 3. Hooks ───────────────────────────────────────────────────────────────
 
   /**
@@ -415,6 +572,15 @@ export default function register(api: OpenClawPluginApi): void {
             `\n\n## Active Workflow: ${active.workflowId}\n` +
             `Current state: ${active.currentState}\n\n${prompt}`;
         }
+      }
+
+      const activeWorkout = engine.getActiveWorkflow("workout-coach");
+      if (!activeWorkout) {
+        ctx.systemPrompt +=
+          "\n\n## Workout Coaching\n" +
+          "Workout coaching is handled by workflow-engine.\n" +
+          "If the user wants to train or asks for today's workout, call get_next_workout.\n" +
+          "Do not determine the next workout from memory.\n";
       }
 
       return ctx;
