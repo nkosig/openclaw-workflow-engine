@@ -24,7 +24,7 @@ import register, {
   type ToolCallContext,
   type ServiceInstance,
   type WorkflowServiceInstance,
-  type ToolRegistration,
+  OpenClawTool,
   type McpServerRegistration,
   type ToolGuardResult,
 } from "../src/openclaw-plugin.js";
@@ -180,7 +180,7 @@ type HandlerFn = (...args: any[]) => Promise<any>;
 
 class MockOpenClawApi implements OpenClawPluginApi {
   readonly config: PluginConfig;
-  readonly tools = new Map<string, ToolRegistration>();
+  readonly tools = new Map<string, OpenClawTool>();
   readonly hooks = new Map<HookName, HandlerFn[]>();
   readonly services = new Map<string, ServiceInstance>();
   readonly mcpServers: McpServerRegistration[] = [];
@@ -193,7 +193,7 @@ class MockOpenClawApi implements OpenClawPluginApi {
     this.services.set(service.id, service);
   }
 
-  registerTool(tool: ToolRegistration): void {
+  registerTool(tool: OpenClawTool): void {
     this.tools.set(tool.name, tool);
   }
 
@@ -215,14 +215,19 @@ class MockOpenClawApi implements OpenClawPluginApi {
     return handler(...args) as Promise<T>;
   }
 
-  /** Invoke a registered tool handler */
+  /** Invoke a registered tool handler via the real OpenClaw execute() shape */
   async callTool(
     name: string,
     input: Record<string, unknown>,
   ): Promise<unknown> {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`No tool '${name}' registered`);
-    return tool.handler(input);
+    const response = await tool.execute("mock-call-id", input);
+    // Tests that inspect the result expect the unwrapped details value, not the
+    // MCP content wrapper — return details when present, otherwise parse text.
+    if (response.details !== undefined) return response.details;
+    const text = response.content[0]?.text ?? "{}";
+    try { return JSON.parse(text); } catch { return text; }
   }
 }
 

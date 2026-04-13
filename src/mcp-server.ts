@@ -76,7 +76,7 @@ export class WorkflowMCPServer {
         : (config.workflowsDir ?? "./workflows");
     this.engine = new WorkflowEngine(config.dbPath);
     this.mcp = new McpServer(
-      { name: "workflow-engine", version: "0.1.0" },
+      { name: "workflow-engine", version: "0.1.1" },
       { capabilities: { tools: { listChanged: true }, resources: {} } },
     );
     this._registerControlTools();

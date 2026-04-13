@@ -72,12 +72,40 @@ export interface ToolCallContext {
   [key: string]: unknown;
 }
 
-/** Registration options for a control tool */
+/**
+ * Internal tool definition — convenient authoring shape used within this file.
+ * Translated to OpenClawTool before being passed to api.registerTool().
+ */
 export interface ToolRegistration {
   name: string;
   description: string;
-  inputSchema: Record<string, unknown>;
+  /**
+   * Flat property map.  Each value is a JSON Schema property object plus an
+   * optional `required: true` flag (stripped before sending to OpenClaw).
+   */
+  inputSchema: Record<string, { type: string; description?: string; required?: boolean; [k: string]: unknown }>;
   handler: (input: Record<string, unknown>) => Promise<unknown>;
+}
+
+/**
+ * Real OpenClaw 2026.4.x tool registration shape.
+ * - `parameters`: full JSON Schema object (type:"object", properties, required[])
+ * - `execute`: handler called by OpenClaw with (toolCallId, params)
+ * - return value must be `{ content: [{ type:"text", text:string }], details? }`
+ */
+export interface OpenClawTool {
+  name: string;
+  description: string;
+  parameters: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+    additionalProperties: false;
+  };
+  execute(
+    toolCallId: string,
+    params: Record<string, unknown>,
+  ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: unknown }>;
 }
 
 /** Registration options for an MCP server side-car */
@@ -105,9 +133,11 @@ export interface OpenClawPluginApi {
   registerService(service: ServiceInstance): void;
   /**
    * Register a tool that appears in the agent's tool list.
-   * OpenClaw 2026.4.x: single object argument; tool.name is used as the key.
+   * OpenClaw 2026.4.x: accepts an OpenClawTool object.
+   * - `parameters` must be a full JSON Schema object (type:"object", properties:{...})
+   * - `execute(toolCallId, params)` is the handler
    */
-  registerTool(tool: ToolRegistration): void;
+  registerTool(tool: OpenClawTool): void;
   /** Register a beforePromptConstruct hook */
   registerHook(
     event: "beforePromptConstruct",
@@ -280,12 +310,43 @@ export default function register(api: OpenClawPluginApi): void {
 
   // ── 2. Control tools ───────────────────────────────────────────────────────
 
-  // Helper: wrap registerTool so a bad schema/options crash is logged but does
-  // not abort the rest of registration.
+  // Translate internal flat inputSchema map → full JSON Schema object
+  // that OpenClaw 2026.4.x expects on tool.parameters.
+  const toJsonSchema = (
+    shape: ToolRegistration["inputSchema"],
+  ): OpenClawTool["parameters"] => {
+    const properties: Record<string, unknown> = {};
+    const required: string[] = [];
+    for (const [key, spec] of Object.entries(shape)) {
+      const { required: isRequired, ...rest } = spec;
+      properties[key] = rest;
+      if (isRequired) required.push(key);
+    }
+    return {
+      type: "object",
+      properties,
+      ...(required.length > 0 ? { required } : {}),
+      additionalProperties: false,
+    };
+  };
+
+  // Helper: translate ToolRegistration → OpenClawTool and call api.registerTool.
+  // Errors are logged rather than thrown so a bad schema doesn't abort all registration.
   const tryRegisterTool = (tool: ToolRegistration) => {
     log(`registerTool ${tool.name}…`);
     try {
-      api.registerTool(tool);
+      api.registerTool({
+        name: tool.name,
+        description: tool.description,
+        parameters: toJsonSchema(tool.inputSchema),
+        async execute(_toolCallId: string, params: Record<string, unknown>) {
+          const result = await tool.handler(params ?? {});
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+            details: result,
+          };
+        },
+      });
       log(`registerTool ${tool.name} ok`);
     } catch (e) {
       const stack = e instanceof Error

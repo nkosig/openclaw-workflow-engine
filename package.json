@@ -1,6 +1,6 @@
 {
   "name": "@openclaw-community/workflow-engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "State machine workflow engine for OpenClaw — Phase 1 standalone core",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,7 +1,7 @@
 {
   "id": "openclaw-community-workflow-engine",
   "name": "Workflow Engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "State machine workflow enforcement for OpenClaw agents. Prevents LLM drift in structured workflows by enforcing deterministic state transitions, per-state tool scoping, input validation, and persistent audit logging.",
   "configSchema": {
     "type": "object",
