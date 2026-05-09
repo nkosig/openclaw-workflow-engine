@@ -35,7 +35,11 @@ export interface PluginConfig {
   dbPath?: string;
   enableDashboard?: boolean;
   dashboardPort?: number;
-  /** Suppress startup log messages (e.g. dashboard URL). Useful in tests. */
+  /**
+   * Enable verbose logging of plugin registration, workflow loading, and other
+   * startup events. Defaults to `true` (logs suppressed). Set to `false` to see
+   * detailed debug output during plugin initialization (e.g. for troubleshooting).
+   */
   silent?: boolean;
 }
 
@@ -83,7 +87,15 @@ export interface ToolRegistration {
    * Flat property map.  Each value is a JSON Schema property object plus an
    * optional `required: true` flag (stripped before sending to OpenClaw).
    */
-  inputSchema: Record<string, { type: string; description?: string; required?: boolean; [k: string]: unknown }>;
+  inputSchema: Record<
+    string,
+    {
+      type: string;
+      description?: string;
+      required?: boolean;
+      [k: string]: unknown;
+    }
+  >;
   handler: (input: Record<string, unknown>) => Promise<unknown>;
 }
 
@@ -105,7 +117,10 @@ export interface OpenClawTool {
   execute(
     toolCallId: string,
     params: Record<string, unknown>,
-  ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: unknown }>;
+  ): Promise<{
+    content: Array<{ type: "text"; text: string }>;
+    details?: unknown;
+  }>;
 }
 
 /** Registration options for an MCP server side-car */
@@ -174,13 +189,14 @@ function resolveConfig(raw: PluginConfig): ResolvedPluginConfig {
     dbPath: raw.dbPath ?? `${home}/.openclaw/workflow.db`,
     enableDashboard: raw.enableDashboard ?? false,
     dashboardPort: raw.dashboardPort ?? 3847,
-    silent: raw.silent ?? false,
+    silent: raw.silent ?? true,
   };
 }
 
 async function registerWorkflowsFromDirectory(
   engine: WorkflowEngine,
   workflowsDir: string,
+  config: ResolvedPluginConfig,
 ): Promise<void> {
   const absDir = resolve(workflowsDir);
   try {
@@ -189,23 +205,31 @@ async function registerWorkflowsFromDirectory(
       if (!entry.endsWith(".yaml") && !entry.endsWith(".yml")) continue;
       const filePath = resolve(absDir, entry);
       engine.registerWorkflowFromYaml(filePath);
-      process.stderr.write(`[workflow-engine] Loaded YAML workflow: ${filePath}\n`);
+      if (!config.silent) {
+        process.stderr.write(
+          `[workflow-engine] Loaded YAML workflow: ${filePath}\n`,
+        );
+      }
     }
   } catch {
     // ignore missing directories; JS loader handles warnings/silence behavior
   }
 
   const defs = await loadWorkflowsFromDir(workflowsDir, {
-    silent: true,
+    silent: config.silent,
   });
   for (const def of defs) {
     try {
       engine.registerWorkflow(def);
-      process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
+      if (!config.silent) {
+        process.stderr.write(`[workflow-engine] Loaded workflow: ${def.id}\n`);
+      }
     } catch (err) {
-      process.stderr.write(
-        `[workflow-engine] Skipping duplicate workflow '${def.id}': ${err}\n`,
-      );
+      if (!config.silent) {
+        process.stderr.write(
+          `[workflow-engine] Skipping duplicate workflow '${def.id}': ${err}\n`,
+        );
+      }
     }
   }
 }
@@ -236,7 +260,9 @@ export default function register(api: OpenClawPluginApi): void {
   };
 
   log("starting");
-  log(`config resolved: dbPath=${config.dbPath} workflowsDir=${config.workflowsDir}`);
+  log(
+    `config resolved: dbPath=${config.dbPath} workflowsDir=${config.workflowsDir}`,
+  );
   const engine = new WorkflowEngine(config.dbPath);
 
   // ── 1. Background service ──────────────────────────────────────────────────
@@ -255,7 +281,7 @@ export default function register(api: OpenClawPluginApi): void {
     },
 
     async start(): Promise<void> {
-      await registerWorkflowsFromDirectory(engine, config.workflowsDir);
+      await registerWorkflowsFromDirectory(engine, config.workflowsDir, config);
 
       // Guard against double-start: close any prior dashboard listener first.
       if (dashboardServer) {
@@ -288,7 +314,7 @@ export default function register(api: OpenClawPluginApi): void {
   // start the dashboard.  This runs whether or not registerService succeeds,
   // so the tools work even when OpenClaw's service lifecycle is unavailable.
   void (async () => {
-    await registerWorkflowsFromDirectory(engine, config.workflowsDir);
+    await registerWorkflowsFromDirectory(engine, config.workflowsDir, config);
     if (config.enableDashboard) {
       dashboardServer = await startDashboard(engine, config.dashboardPort, {
         silent: config.silent,
@@ -342,16 +368,19 @@ export default function register(api: OpenClawPluginApi): void {
         async execute(_toolCallId: string, params: Record<string, unknown>) {
           const result = await tool.handler(params ?? {});
           return {
-            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+            content: [
+              { type: "text" as const, text: JSON.stringify(result, null, 2) },
+            ],
             details: result,
           };
         },
       });
       log(`registerTool ${tool.name} ok`);
     } catch (e) {
-      const stack = e instanceof Error
-        ? e.stack?.split("\n").slice(0, 6).join(" | ")
-        : String(e);
+      const stack =
+        e instanceof Error
+          ? e.stack?.split("\n").slice(0, 6).join(" | ")
+          : String(e);
       log(`registerTool ${tool.name} threw: ${e} | stack: ${stack}`);
     }
   };
@@ -382,7 +411,11 @@ export default function register(api: OpenClawPluginApi): void {
       };
     }
 
-    const validation = engine.validateToolCall(active.instanceId, toolName, input);
+    const validation = engine.validateToolCall(
+      active.instanceId,
+      toolName,
+      input,
+    );
     if (!validation.valid) {
       return {
         error: true,
@@ -432,7 +465,11 @@ export default function register(api: OpenClawPluginApi): void {
     name: "workflow_start",
     description: "Start a new workflow instance",
     inputSchema: {
-      workflowId: { type: "string", description: "ID of the workflow to start", required: true },
+      workflowId: {
+        type: "string",
+        description: "ID of the workflow to start",
+        required: true,
+      },
       context: { type: "object", description: "Optional initial context" },
     },
     async handler(input: Record<string, unknown>) {
@@ -449,7 +486,11 @@ export default function register(api: OpenClawPluginApi): void {
     description:
       "Get the current state, available tools, and progress of a workflow instance",
     inputSchema: {
-      instanceId: { type: "string", description: "Workflow instance ID", required: true },
+      instanceId: {
+        type: "string",
+        description: "Workflow instance ID",
+        required: true,
+      },
     },
     async handler(input: Record<string, unknown>) {
       const { instanceId } = input as { instanceId: string };
@@ -461,7 +502,11 @@ export default function register(api: OpenClawPluginApi): void {
     name: "workflow_reset",
     description: "Cancel a workflow instance and start a fresh one",
     inputSchema: {
-      instanceId: { type: "string", description: "Workflow instance ID to reset", required: true },
+      instanceId: {
+        type: "string",
+        description: "Workflow instance ID to reset",
+        required: true,
+      },
     },
     async handler(input: Record<string, unknown>) {
       const { instanceId } = input as { instanceId: string };
@@ -483,8 +528,15 @@ export default function register(api: OpenClawPluginApi): void {
     name: "workflow_audit",
     description: "Retrieve the audit log for a workflow instance",
     inputSchema: {
-      instanceId: { type: "string", description: "Workflow instance ID", required: true },
-      limit: { type: "number", description: "Maximum number of entries to return (default 100)" },
+      instanceId: {
+        type: "string",
+        description: "Workflow instance ID",
+        required: true,
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of entries to return (default 100)",
+      },
     },
     async handler(input: Record<string, unknown>) {
       const { instanceId, limit } = input as {
@@ -497,10 +549,16 @@ export default function register(api: OpenClawPluginApi): void {
 
   tryRegisterTool({
     name: "get_next_workout",
-    description: "Get the next workout in rotation or resume an active workout session",
+    description:
+      "Get the next workout in rotation or resume an active workout session",
     inputSchema: {},
     async handler() {
-      return executeWorkflowTool("workout-coach", "get_next_workout", {}, { autoStart: true });
+      return executeWorkflowTool(
+        "workout-coach",
+        "get_next_workout",
+        {},
+        { autoStart: true },
+      );
     },
   });
 
@@ -520,7 +578,11 @@ export default function register(api: OpenClawPluginApi): void {
       },
     },
     async handler(input) {
-      return executeWorkflowTool("workout-coach", "start_workout_session", input);
+      return executeWorkflowTool(
+        "workout-coach",
+        "start_workout_session",
+        input,
+      );
     },
   });
 
@@ -598,7 +660,11 @@ export default function register(api: OpenClawPluginApi): void {
       },
     },
     async handler(input) {
-      return executeWorkflowTool("workout-coach", "cancel_workout_session", input);
+      return executeWorkflowTool(
+        "workout-coach",
+        "cancel_workout_session",
+        input,
+      );
     },
   });
 
